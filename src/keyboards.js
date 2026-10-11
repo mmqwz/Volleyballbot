@@ -26,7 +26,25 @@ export function eventActionsKeyboard(eventId, joined, { shared = false } = {}) {
   } else {
     kb.text("✅ Записаться", `join:${eventId}`);
   }
-  kb.row().text("🔄 Обновить список", `refresh:${eventId}`);
+  kb.row()
+    .text("💳 Я оплатил", `payself:${eventId}`)
+    .text("👥 Оплата за нескольких", `paymulti:${eventId}`);
+  kb.row().text("🔄 Обновить", `refresh:${eventId}`);
+  return kb;
+}
+
+export function payMultiKeyboard(eventId, unpaidParticipants, selectedIds) {
+  const selected = new Set(selectedIds.map(Number));
+  const kb = new InlineKeyboard();
+
+  for (const p of unpaidParticipants) {
+    const mark = selected.has(Number(p.user_id)) ? "☑️" : "⬜️";
+    const name = p.full_name.slice(0, 28);
+    kb.text(`${mark} ${name}`, `paytog:${eventId}:${p.user_id}`).row();
+  }
+
+  kb.text("✅ Подтвердить оплату", `payok:${eventId}`).row();
+  kb.text("❌ Отмена", `paycancel:${eventId}`);
   return kb;
 }
 

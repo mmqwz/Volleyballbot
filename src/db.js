@@ -35,10 +35,32 @@ db.exec(`
     full_name TEXT NOT NULL,
     username TEXT,
     joined_at TEXT NOT NULL DEFAULT (datetime('now')),
+    paid INTEGER NOT NULL DEFAULT 0,
+    paid_by INTEGER,
+    paid_at TEXT,
     UNIQUE(event_id, user_id),
     FOREIGN KEY(event_id) REFERENCES events(id) ON DELETE CASCADE
   );
+
+  CREATE TABLE IF NOT EXISTS ephemeral_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id INTEGER NOT NULL,
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    UNIQUE(chat_id, message_id)
+  );
 `);
+
+function ensureColumn(table, column, ddl) {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all();
+  if (!cols.some((c) => c.name === column)) {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddl}`);
+  }
+}
+
+ensureColumn("participants", "paid", "INTEGER NOT NULL DEFAULT 0");
+ensureColumn("participants", "paid_by", "INTEGER");
+ensureColumn("participants", "paid_at", "TEXT");
 
 export function createEvent({
   title,
@@ -91,6 +113,16 @@ export function getParticipants(eventId) {
     .all(eventId);
 }
 
+export function getParticipant(eventId, userId) {
+  return (
+    db
+      .prepare(
+        `SELECT * FROM participants WHERE event_id = ? AND user_id = ?`
+      )
+      .get(eventId, userId) ?? null
+  );
+}
+
 export function getParticipantCount(eventId) {
   const row = db
     .prepare(`SELECT COUNT(*) AS count FROM participants WHERE event_id = ?`)
@@ -99,12 +131,7 @@ export function getParticipantCount(eventId) {
 }
 
 export function isJoined(eventId, userId) {
-  const row = db
-    .prepare(
-      `SELECT 1 AS ok FROM participants WHERE event_id = ? AND user_id = ?`
-    )
-    .get(eventId, userId);
-  return Boolean(row);
+  return Boolean(getParticipant(eventId, userId));
 }
 
 export function joinEvent(eventId, user) {
@@ -142,7 +169,96 @@ export function leaveEvent(eventId, userId) {
     `DELETE FROM participants WHERE event_id = ? AND user_id = ?`
   ).run(eventId, userId);
 
-  return { ok: true, participants: getParticipants(eventId), event };
+  // убрать этого человека из чужих черновиков оплаты нельзя в БД — только в сессии
+  return { ok: true, participants: getParticipants(eventId), event: getEvent(eventId) };
+}
+
+export function markPaid(eventId, targetUserIds, paidBy) {
+  const event = getEvent(eventId);
+  if (!event || event.status !== "active") {
+    return { ok: false, reason: "not_found" };
+  }
+  if (!isJoined(eventId, paidBy)) {
+    return { ok: false, reason: "payer_not_joined" };
+  }
+
+  const uniqueIds = [...new Set(targetUserIds.map(Number))];
+  if (!uniqueIds.length) {
+    return { ok: false, reason: "empty" };
+  }
+
+  const invalid = [];
+  const alreadyPaid = [];
+  const okIds = [];
+
+  for (const uid of uniqueIds) {
+    const p = getParticipant(eventId, uid);
+    if (!p) {
+      invalid.push(uid);
+      continue;
+    }
+    if (Number(p.paid) === 1) {
+      alreadyPaid.push(p);
+      continue;
+    }
+    okIds.push(uid);
+  }
+
+  if (invalid.length) {
+    return { ok: false, reason: "invalid_selection", invalid };
+  }
+  if (alreadyPaid.length && !okIds.length) {
+    return { ok: false, reason: "already_paid", alreadyPaid };
+  }
+  if (!okIds.length) {
+    return { ok: false, reason: "empty" };
+  }
+
+  const stmt = db.prepare(
+    `UPDATE participants
+     SET paid = 1, paid_by = ?, paid_at = datetime('now')
+     WHERE event_id = ? AND user_id = ? AND paid = 0`
+  );
+  for (const uid of okIds) {
+    stmt.run(paidBy, eventId, uid);
+  }
+
+  return {
+    ok: true,
+    paidIds: okIds,
+    skippedPaid: alreadyPaid,
+    participants: getParticipants(eventId),
+    event: getEvent(eventId),
+  };
+}
+
+export function trackEphemeral(eventId, chatId, messageId) {
+  db.prepare(
+    `INSERT OR IGNORE INTO ephemeral_messages (event_id, chat_id, message_id)
+     VALUES (?, ?, ?)`
+  ).run(eventId, chatId, messageId);
+}
+
+export function listEphemeral(eventId, chatId) {
+  return db
+    .prepare(
+      `SELECT message_id FROM ephemeral_messages
+       WHERE event_id = ? AND chat_id = ?`
+    )
+    .all(eventId, chatId)
+    .map((r) => Number(r.message_id));
+}
+
+export function clearEphemeral(eventId, chatId) {
+  db.prepare(
+    `DELETE FROM ephemeral_messages WHERE event_id = ? AND chat_id = ?`
+  ).run(eventId, chatId);
+}
+
+export function removeEphemeral(chatId, messageId) {
+  db.prepare(
+    `DELETE FROM ephemeral_messages WHERE chat_id = ? AND message_id = ?`
+  ).run(chatId, messageId);
 }
 
 export function closeDb() {
