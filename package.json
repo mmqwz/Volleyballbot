@@ -1,0 +1,19 @@
+{
+  "name": "volleyball-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "grammy": "^1.35.0",
+    "https-proxy-agent": "^9.1.0",
+    "undici": "^8.11.2"
+  }
+}
