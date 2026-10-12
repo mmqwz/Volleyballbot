@@ -2,7 +2,7 @@ import { GrammyError, HttpError } from "grammy";
 import { config, isAdmin } from "./config.js";
 import { createBot } from "./createBot.js";
 import {
-  clearEphemeral,
+  clearEphemeralByChat,
   createEvent,
   getEvent,
   getParticipants,
@@ -10,8 +10,9 @@ import {
   joinEvent,
   leaveEvent,
   listActiveEvents,
-  listEphemeral,
+  listEphemeralByChat,
   markPaid,
+  protectedMessageIds,
   removeEphemeral,
   setAnnounceMessage,
   setEventStatus,
@@ -51,33 +52,50 @@ async function safeDelete(api, chatId, messageId) {
   try {
     await api.deleteMessage(chatId, messageId);
   } catch {
-    // уже удалено / нет прав
+    // уже удалено / нет прав (в личке бот не может удалять сообщения пользователя)
   }
 }
 
-/** Удаляет служебные сообщения бота, карточку события не трогает */
-async function purgeEphemeral(ctx, event, chatId) {
-  if (!event || !chatId) return;
-  const ids = listEphemeral(event.id, chatId);
-  const keep = Number(event.announce_message_id);
+function chatIdOf(ctx) {
+  return ctx.chat?.id ?? ctx.callbackQuery?.message?.chat?.id ?? null;
+}
+
+/** Удаляет все служебные сообщения бота в чате; карточки событий не трогает */
+async function purgeChat(ctx, chatId) {
+  if (!chatId) return;
+  const keep = protectedMessageIds(chatId);
+  const ids = listEphemeralByChat(chatId);
   for (const messageId of ids) {
-    if (messageId === keep) continue;
+    if (keep.has(messageId)) continue;
     await safeDelete(ctx.api, chatId, messageId);
   }
-  clearEphemeral(event.id, chatId);
+  clearEphemeralByChat(chatId);
+}
+
+async function tryDeleteUserMessage(ctx) {
+  const msg = ctx.message;
+  if (!msg) return;
+  // в группах с правами админа сработает; в личке Telegram это запрещает
+  await safeDelete(ctx.api, msg.chat.id, msg.message_id);
+}
+
+/** Ответ бота с очисткой прошлых служебных сообщений */
+async function replyClean(ctx, text, extra = {}, eventId = 0) {
+  const chatId = chatIdOf(ctx);
+  await tryDeleteUserMessage(ctx);
+  if (chatId) await purgeChat(ctx, chatId);
+  const msg = chatId
+    ? await ctx.api.sendMessage(chatId, text, extra)
+    : await ctx.reply(text, extra);
+  const keep = chatId ? protectedMessageIds(chatId) : new Set();
+  if (chatId && !keep.has(msg.message_id)) {
+    trackEphemeral(eventId, chatId, msg.message_id);
+  }
+  return msg;
 }
 
 async function sendEphemeral(ctx, event, text, extra = {}) {
-  const chatId = ctx.chat?.id ?? ctx.callbackQuery?.message?.chat?.id;
-  if (!chatId || !event) {
-    return ctx.reply(text, extra);
-  }
-  await purgeEphemeral(ctx, event, chatId);
-  const msg = await ctx.api.sendMessage(chatId, text, extra);
-  if (msg.message_id !== event.announce_message_id) {
-    trackEphemeral(event.id, chatId, msg.message_id);
-  }
-  return msg;
+  return replyClean(ctx, text, extra, event?.id ?? 0);
 }
 
 async function refreshAnnounce(ctx, event) {
@@ -179,13 +197,13 @@ function payPickerText(event, selectedIds) {
 bot.command("start", async (ctx) => {
   const admin = isAdmin(ctx.from.id);
   sessions.delete(ctx.from.id);
-  await ctx.reply(`Привет, ${displayName(ctx.from)}!\n\n${helpText(admin)}`, {
+  await replyClean(ctx, `Привет, ${displayName(ctx.from)}!\n\n${helpText(admin)}`, {
     reply_markup: mainMenu(admin),
   });
 });
 
 bot.command("help", async (ctx) => {
-  await ctx.reply(helpText(isAdmin(ctx.from.id)), {
+  await replyClean(ctx, helpText(isAdmin(ctx.from.id)), {
     reply_markup: mainMenu(isAdmin(ctx.from.id)),
   });
 });
@@ -194,10 +212,11 @@ bot.command("events", async (ctx) => showEvents(ctx));
 
 bot.command("admin", async (ctx) => {
   if (!isAdmin(ctx.from.id)) {
-    await ctx.reply("Команда только для админов.");
+    await replyClean(ctx, "Команда только для админов.");
     return;
   }
-  await ctx.reply(
+  await replyClean(
+    ctx,
     "Админ-панель:\n\n• «➕ Создать событие» или /new_event\n• «🏐 События» — управление и публикация",
     { reply_markup: mainMenu(true) }
   );
@@ -207,15 +226,16 @@ bot.command("new_event", async (ctx) => startCreateEvent(ctx));
 
 bot.hears("🏐 События", async (ctx) => showEvents(ctx));
 bot.hears("ℹ️ Помощь", async (ctx) => {
-  await ctx.reply(helpText(isAdmin(ctx.from.id)));
+  await replyClean(ctx, helpText(isAdmin(ctx.from.id)));
 });
 bot.hears("➕ Создать событие", async (ctx) => startCreateEvent(ctx));
 bot.hears("🛠 Админ", async (ctx) => {
   if (!isAdmin(ctx.from.id)) {
-    await ctx.reply("Доступ только для админов.");
+    await replyClean(ctx, "Доступ только для админов.");
     return;
   }
-  await ctx.reply(
+  await replyClean(
+    ctx,
     "Админ-панель:\n\n• Создайте событие\n• Опубликуйте карточку\n• Игроки записываются и отмечают оплату",
     { reply_markup: mainMenu(true) }
   );
@@ -223,38 +243,64 @@ bot.hears("🛠 Админ", async (ctx) => {
 
 bot.hears("❌ Отмена", async (ctx) => {
   if (!sessions.has(ctx.from.id)) {
-    await ctx.reply("Нечего отменять.", {
+    await replyClean(ctx, "Нечего отменять.", {
       reply_markup: mainMenu(isAdmin(ctx.from.id)),
     });
     return;
   }
   sessions.delete(ctx.from.id);
-  await ctx.reply("Отменено.", {
+  await replyClean(ctx, "Отменено.", {
     reply_markup: mainMenu(isAdmin(ctx.from.id)),
   });
 });
 
 async function startCreateEvent(ctx) {
   if (!isAdmin(ctx.from.id)) {
-    await ctx.reply("Создавать события могут только админы.");
+    await replyClean(ctx, "Создавать события могут только админы.");
     return;
   }
-  sessions.set(ctx.from.id, { step: "title", draft: {} });
-  await ctx.reply(
+  const msg = await replyClean(
+    ctx,
     "Создание события.\n\nШаг 1/5 — название (например: «Волейбол в пятницу»)",
     { reply_markup: cancelKeyboard() }
   );
+  sessions.set(ctx.from.id, {
+    step: "title",
+    draft: {},
+    wizardChatId: msg.chat.id,
+    wizardMessageId: msg.message_id,
+  });
+}
+
+async function editWizard(ctx, text) {
+  const sess = sessions.get(ctx.from.id);
+  await tryDeleteUserMessage(ctx);
+  if (sess?.wizardChatId && sess?.wizardMessageId) {
+    try {
+      // editMessageText не принимает обычную reply-клавиатуру — только текст шага
+      await ctx.api.editMessageText(sess.wizardChatId, sess.wizardMessageId, text);
+      return;
+    } catch {
+      // если нельзя отредактировать — отправим новое чистое
+    }
+  }
+  const msg = await replyClean(ctx, text, { reply_markup: cancelKeyboard() });
+  if (sess) {
+    sess.wizardChatId = msg.chat.id;
+    sess.wizardMessageId = msg.message_id;
+    sessions.set(ctx.from.id, sess);
+  }
 }
 
 async function showEvents(ctx) {
   const events = listActiveEvents();
   if (!events.length) {
-    await ctx.reply("Пока нет активных событий.", {
+    await replyClean(ctx, "Пока нет активных событий.", {
       reply_markup: mainMenu(isAdmin(ctx.from.id)),
     });
     return;
   }
-  await ctx.reply("Выберите событие:", {
+  await replyClean(ctx, "Выберите событие:", {
     reply_markup: eventsListKeyboard(events),
   });
 }
@@ -384,9 +430,9 @@ bot.on("callback_query:data", async (ctx) => {
     }
     await ctx.answerCallbackQuery({ text: "Вы записаны!" });
     await syncEventView(ctx, result.event);
-    const chatId = ctx.callbackQuery.message.chat.id;
-    await purgeEphemeral(ctx, result.event, chatId);
-    // короткий тост уже в callback; список виден в карточке события
+    if (!isAnnounceMessage(ctx, result.event)) {
+      await purgeChat(ctx, ctx.callbackQuery.message.chat.id);
+    }
     return;
   }
 
@@ -409,7 +455,9 @@ bot.on("callback_query:data", async (ctx) => {
     }
     await ctx.answerCallbackQuery({ text: "Вы отписались" });
     await syncEventView(ctx, result.event);
-    await purgeEphemeral(ctx, result.event, ctx.callbackQuery.message.chat.id);
+    if (!isAnnounceMessage(ctx, result.event)) {
+      await purgeChat(ctx, ctx.callbackQuery.message.chat.id);
+    }
     return;
   }
 
@@ -431,7 +479,9 @@ bot.on("callback_query:data", async (ctx) => {
     }
     await ctx.answerCallbackQuery({ text: "Оплата за себя отмечена ✅" });
     await syncEventView(ctx, result.event);
-    await purgeEphemeral(ctx, result.event, ctx.callbackQuery.message.chat.id);
+    if (!isAnnounceMessage(ctx, result.event)) {
+      await purgeChat(ctx, ctx.callbackQuery.message.chat.id);
+    }
     return;
   }
 
@@ -532,9 +582,7 @@ bot.on("callback_query:data", async (ctx) => {
 
     await ctx.answerCallbackQuery({ text: "Оплата подтверждена ✅" });
     await syncEventView(ctx, result.event);
-    await purgeEphemeral(ctx, result.event, ctx.callbackQuery.message.chat.id);
-
-    // короткое служебное — и сразу в ephemeral (потом сотрётся следующим действием)
+    await purgeChat(ctx, ctx.callbackQuery.message.chat.id);
     await sendEphemeral(
       ctx,
       result.event,
@@ -546,7 +594,7 @@ bot.on("callback_query:data", async (ctx) => {
   if (action === "paycancel") {
     sessions.delete(ctx.from.id);
     await ctx.answerCallbackQuery({ text: "Отменено" });
-    await purgeEphemeral(ctx, event, ctx.callbackQuery.message.chat.id);
+    await purgeChat(ctx, ctx.callbackQuery.message.chat.id);
     await syncEventView(ctx, event);
     return;
   }
@@ -561,7 +609,7 @@ bot.on("callback_query:data", async (ctx) => {
     }
     const participants = getParticipants(eventId);
     const chatId = ctx.callbackQuery.message.chat.id;
-    await purgeEphemeral(ctx, event, chatId);
+    await purgeChat(ctx, chatId);
     const msg = await ctx.reply(formatEventCard(event, participants), {
       parse_mode: "HTML",
       reply_markup: eventActionsKeyboard(eventId, false, { shared: true }),
@@ -616,27 +664,26 @@ bot.on("message:text", async (ctx, next) => {
   if (session.step === "title") {
     session.draft.title = text;
     session.step = "time";
-    await ctx.reply("Шаг 2/5 — дата и время (например: «Пт 18.10 в 19:00»)", {
-      reply_markup: cancelKeyboard(),
-    });
+    sessions.set(ctx.from.id, session);
+    await editWizard(ctx, "Шаг 2/5 — дата и время (например: «Пт 18.10 в 19:00»)");
     return;
   }
 
   if (session.step === "time") {
     session.draft.eventTime = text;
     session.step = "place";
-    await ctx.reply("Шаг 3/5 — место проведения (адрес / зал)", {
-      reply_markup: cancelKeyboard(),
-    });
+    sessions.set(ctx.from.id, session);
+    await editWizard(ctx, "Шаг 3/5 — место проведения (адрес / зал)");
     return;
   }
 
   if (session.step === "place") {
     session.draft.place = text;
     session.step = "payment";
-    await ctx.reply(
-      "Шаг 4/5 — реквизиты для оплаты (карта, СБП, телефон, сумма и т.д.)",
-      { reply_markup: cancelKeyboard() }
+    sessions.set(ctx.from.id, session);
+    await editWizard(
+      ctx,
+      "Шаг 4/5 — реквизиты для оплаты (карта, СБП, телефон, сумма и т.д.)"
     );
     return;
   }
@@ -644,9 +691,10 @@ bot.on("message:text", async (ctx, next) => {
   if (session.step === "payment") {
     session.draft.paymentDetails = text;
     session.step = "max";
-    await ctx.reply(
-      "Шаг 5/5 — максимум участников (число). Напишите 0, если без лимита.",
-      { reply_markup: cancelKeyboard() }
+    sessions.set(ctx.from.id, session);
+    await editWizard(
+      ctx,
+      "Шаг 5/5 — максимум участников (число). Напишите 0, если без лимита."
     );
     return;
   }
@@ -654,9 +702,7 @@ bot.on("message:text", async (ctx, next) => {
   if (session.step === "max") {
     const maxPlayers = Number(text);
     if (!Number.isInteger(maxPlayers) || maxPlayers < 0) {
-      await ctx.reply("Введите целое число ≥ 0 (0 = без лимита).", {
-        reply_markup: cancelKeyboard(),
-      });
+      await editWizard(ctx, "Введите целое число ≥ 0 (0 = без лимита).");
       return;
     }
 
@@ -670,9 +716,12 @@ bot.on("message:text", async (ctx, next) => {
     });
     sessions.delete(ctx.from.id);
 
-    await ctx.reply("✅ Событие создано!", {
-      reply_markup: mainMenu(true),
-    });
+    await tryDeleteUserMessage(ctx);
+    await purgeChat(ctx, chatIdOf(ctx));
+    if (session.wizardChatId && session.wizardMessageId) {
+      await safeDelete(ctx.api, session.wizardChatId, session.wizardMessageId);
+    }
+
     const card = await ctx.reply(formatEventCard(event, []), {
       parse_mode: "HTML",
       reply_markup: adminEventKeyboard(event.id),

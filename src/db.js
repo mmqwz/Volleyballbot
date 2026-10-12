@@ -236,29 +236,40 @@ export function trackEphemeral(eventId, chatId, messageId) {
   db.prepare(
     `INSERT OR IGNORE INTO ephemeral_messages (event_id, chat_id, message_id)
      VALUES (?, ?, ?)`
-  ).run(eventId, chatId, messageId);
+  ).run(eventId ?? 0, chatId, messageId);
 }
 
-export function listEphemeral(eventId, chatId) {
+export function listEphemeralByChat(chatId) {
   return db
     .prepare(
-      `SELECT message_id FROM ephemeral_messages
-       WHERE event_id = ? AND chat_id = ?`
+      `SELECT message_id FROM ephemeral_messages WHERE chat_id = ?`
     )
-    .all(eventId, chatId)
+    .all(chatId)
     .map((r) => Number(r.message_id));
 }
 
-export function clearEphemeral(eventId, chatId) {
-  db.prepare(
-    `DELETE FROM ephemeral_messages WHERE event_id = ? AND chat_id = ?`
-  ).run(eventId, chatId);
+export function clearEphemeralByChat(chatId) {
+  db.prepare(`DELETE FROM ephemeral_messages WHERE chat_id = ?`).run(chatId);
 }
 
 export function removeEphemeral(chatId, messageId) {
   db.prepare(
     `DELETE FROM ephemeral_messages WHERE chat_id = ? AND message_id = ?`
   ).run(chatId, messageId);
+}
+
+/** message_id карточек событий, которые нельзя удалять */
+export function protectedMessageIds(chatId) {
+  return new Set(
+    db
+      .prepare(
+        `SELECT announce_message_id AS mid FROM events
+         WHERE announce_chat_id = ? AND announce_message_id IS NOT NULL`
+      )
+      .all(chatId)
+      .map((r) => Number(r.mid))
+      .filter((n) => Number.isFinite(n))
+  );
 }
 
 export function closeDb() {
